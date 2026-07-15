@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Orbitrap 3D Physics Simulator</title>
+    <link rel="stylesheet" href="/index.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+</head>
+<body>
+    <header>
+        <div class="logo-container">
+            <div class="logo-icon">O</div>
+            <div>
+                <h1>Orbitrap 3D Physics Simulator</h1>
+                <div class="sub-title">Kingdon Electrostatic Quadru-Logarithmic Potential Simulation</div>
+            </div>
+        </div>
+    </header>
+
+    <div class="app-container">
+        <main class="visual-panel">
+            <div class="canvas-container" id="p5-canvas-holder">
+                <div class="canvas-overlay-controls">
+                    <button class="btn btn-primary btn-sm" id="btn-camera-reset">Reset Camera</button>
+                    <button class="btn btn-sm" id="btn-toggle-grid">Toggle Grid</button>
+                </div>
+                <div class="canvas-overlay-stats">
+                    <div class="stat-item">Voltage: <span class="val" id="stat-voltage">200 V</span></div>
+                    <div class="stat-item">Trapped: <span class="val" id="stat-trapped">3 / 3</span></div>
+                    <div class="stat-item">Time elapsed: <span class="val" id="stat-time">0.00 &mu;s</span></div>
+                </div>
+                <div class="canvas-nav-tips">
+                    Drag mouse to Rotate 3D &bull; Scroll to Zoom
+                </div>
+            </div>
+
+            <div class="bottom-controls-bar">
+                <div class="sim-controls-group">
+                    <button class="btn btn-primary" id="btn-play">Pause</button>
+                    <button class="btn" id="btn-step">Single Step</button>
+                    <button class="btn btn-danger" id="btn-reset">Reset Sim</button>
+                </div>
+
+                <div class="speed-control">
+                    <label for="input-sim-speed">Simulation speed</label>
+                    <div class="speed-input-wrap">
+                        <input type="number" id="input-sim-speed" min="0.01" step="any" value="2" inputmode="decimal" aria-describedby="speed-help">
+                        <span aria-hidden="true">×</span>
+                    </div>
+                    <span class="speed-help" id="speed-help">Any value above 0</span>
+                </div>
+
+                <div class="sim-controls-group">
+                    <button class="btn btn-primary" id="btn-inject">Re-inject Ions</button>
+                </div>
+            </div>
+        </main>
+
+        <aside class="sidebar-panel">
+            <div class="tab-container">
+                <div class="tab-header">
+                    <button class="tab-btn active" data-tab="tab-detector">Detector</button>
+                    <button class="tab-btn" data-tab="tab-trajectory">Axis Plots</button>
+                    <button class="tab-btn" data-tab="tab-control">Trapping Settings</button>
+                    <button class="tab-btn" data-tab="tab-theory">Physics Theory</button>
+                </div>
+
+                <div class="tab-content active" id="tab-detector">
+                    <div class="controls-card">
+                        <div class="card-title">
+                            <span>Image Current (Oscilloscope)</span>
+                            <span style="font-size:9px; color:var(--accent-cyan);">Differential Amplifier</span>
+                        </div>
+                        <div class="plot-container">
+                            <div class="plot-label-y">Induced Current I(t)</div>
+                            <div class="plot-label-x">Time (t)</div>
+                            <canvas class="plot-canvas" id="canvas-oscilloscope"></canvas>
+                        </div>
+                        <div class="control-group">
+                            <div class="control-label">Signal Noise: <span class="value" id="lbl-noise">5%</span></div>
+                            <input type="range" id="slider-noise" min="0" max="30" step="1" value="5">
+                        </div>
+                    </div>
+
+                    <div class="controls-card">
+                        <div class="card-title">
+                            <span>Mass Spectrum (Fourier Transform)</span>
+                            <span style="font-size:9px; color:var(--accent-gold);">FTMS</span>
+                        </div>
+                        <div class="plot-container">
+                            <div class="plot-label-y">Intensity (dB)</div>
+                            <div class="plot-label-x">m/z (Mass-to-charge)</div>
+                            <canvas class="plot-canvas" id="canvas-mass-spec"></canvas>
+                        </div>
+                        <div style="font-size:10px; color:var(--text-dim); text-align:center; font-family:var(--font-mono)">
+                            m/z &propto; 1 / f<sub>axial</sub><sup>2</sup> &bull; Higher transient time = better resolution
+                        </div>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="tab-trajectory">
+                    <div class="controls-card">
+                        <div class="card-title">
+                            <span>Select Ion for Inspection</span>
+                        </div>
+                        <select id="select-inspect-ion">
+                            <option value="0">Ion 1 (m/z 300 - Cyan)</option>
+                            <option value="1">Ion 2 (m/z 400 - Yellow)</option>
+                            <option value="2">Ion 3 (m/z 500 - Pink)</option>
+                        </select>
+                    </div>
+
+                    <div class="controls-card">
+                        <div class="card-title">
+                            <span>Ion Coordinates vs Time</span>
+                        </div>
+                        <div class="plot-container" style="height: 220px;">
+                            <div class="plot-label-y">Displacement (mm)</div>
+                            <div class="plot-label-x">Time (t)</div>
+                            <canvas class="plot-canvas" id="canvas-ion-axes"></canvas>
+                        </div>
+                        <div style="font-size:10px; color:var(--text-dim); text-align:center; font-family:var(--font-mono)">
+                            <span style="color:var(--accent-green)">X (Radial)</span> &bull; 
+                            <span style="color:var(--accent-magenta)">Y (Radial)</span> &bull; 
+                            <span style="color:var(--accent-cyan)">Z (Axial Harmonic)</span>
+                        </div>
+                    </div>
+
+                    <div class="controls-card">
+                        <div class="card-title">Selected Ion Inspector</div>
+                        <div class="inspector-grid">
+                            <div class="inspector-item">
+                                <span class="lbl">Mass (m/z)</span>
+                                <span class="val highlight" id="inspect-mz">400.0</span>
+                            </div>
+                            <div class="inspector-item">
+                                <span class="lbl">State</span>
+                                <span class="val" id="inspect-status">Orbiting</span>
+                            </div>
+                            <div class="inspector-item">
+                                <span class="lbl">Position (x,y,z)</span>
+                                <span class="val" id="inspect-pos">0.0, 0.0, 0.0</span>
+                            </div>
+                            <div class="inspector-item">
+                                <span class="lbl">Velocity (vx,vy,vz)</span>
+                                <span class="val" id="inspect-vel">0.0, 0.0, 0.0</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="tab-control">
+                    <div class="controls-card">
+                        <div class="card-title">Electrodynamic Trapping</div>
+                        <div class="toggle-container">
+                            <span class="control-label" style="font-size:12px; font-weight:600;">Voltage Ramping</span>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="toggle-voltage-ramping" checked>
+                                <span class="slider-toggle"></span>
+                            </label>
+                        </div>
+                        <div style="font-size:10.5px; color:var(--text-muted); margin-bottom:8px;">
+                            Gradually ramp the spindle voltage during injection to squeeze orbits and prevent ions from colliding with the injector or escaping!
+                        </div>
+                        <div class="control-group">
+                            <div class="control-label">Injection Voltage: <span class="value" id="lbl-v-init">200 V</span></div>
+                            <input type="range" id="slider-v-init" min="50" max="1000" step="50" value="200">
+                        </div>
+                        <div class="control-group">
+                            <div class="control-label">Target Trapping Voltage: <span class="value" id="lbl-v-final">2000 V</span></div>
+                            <input type="range" id="slider-v-final" min="1000" max="4000" step="100" value="2000">
+                        </div>
+                        <div class="control-group">
+                            <div class="control-label">Ramp Duration: <span class="value" id="lbl-t-ramp">3.0 &mu;s</span></div>
+                            <input type="range" id="slider-t-ramp" min="1.0" max="8.0" step="0.2" value="3.0">
+                        </div>
+                    </div>
+
+                    <div class="controls-card">
+                        <div class="card-title">Add Custom Ion</div>
+                        <div class="ion-adder-form">
+                            <div class="form-row">
+                                <div class="form-col">
+                                    <label class="control-label">Mass (m/z)</label>
+                                    <input type="number" id="input-add-mz" min="100" max="1000" value="350">
+                                </div>
+                                <div class="form-col">
+                                    <label class="control-label">Color</label>
+                                    <select id="select-add-color">
+                                        <option value="cyan">Cyan</option>
+                                        <option value="gold" selected>Gold</option>
+                                        <option value="magenta">Magenta</option>
+                                        <option value="green">Lime Green</option>
+                                        <option value="orange">Orange</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-col">
+                                    <label class="control-label">Inj. Radius (mm)</label>
+                                    <input type="number" id="input-add-radius" min="15" max="38" value="30">
+                                </div>
+                                <div class="form-col">
+                                    <label class="control-label">Inj. Axial (mm)</label>
+                                    <input type="number" id="input-add-z" min="-40" max="40" value="15">
+                                </div>
+                            </div>
+                            <button class="btn btn-primary btn-sm" id="btn-add-ion">Add & Inject Ion</button>
+                        </div>
+                    </div>
+
+                    <div class="controls-card">
+                        <div class="card-title">Electrode Display Options</div>
+                        <div class="control-group">
+                            <div class="control-label">Outer Barrel Cutaway: <span class="value" id="lbl-cutaway">180&deg;</span></div>
+                            <input type="range" id="slider-cutaway" min="120" max="360" step="10" value="180">
+                        </div>
+                        <div class="control-group">
+                            <div class="control-label">Outer Electrode Opacity: <span class="value" id="lbl-opacity-outer">40%</span></div>
+                            <input type="range" id="slider-opacity-outer" min="0" max="100" step="5" value="40">
+                        </div>
+                        <div class="control-group">
+                            <div class="control-label">Spindle Opacity: <span class="value" id="lbl-opacity-inner">90%</span></div>
+                            <input type="range" id="slider-opacity-inner" min="0" max="100" step="5" value="90">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="tab-content" id="tab-theory">
+                    <div class="theory-doc">
+                        <h3>The Electrostatic Potential</h3>
+                        <p>The Orbitrap is an electrostatic ion trap that confines ions using a <strong>quadro-logarithmic</strong> electrostatic potential field (often called the Kingdon potential):</p>
+                        <div class="theory-equation">
+                            U(r, z) = k/2 &middot; (z<sup>2</sup> - r<sup>2</sup>/2) + k/2 &middot; R<sub>m</sub><sup>2</sup> &middot; ln(r / R<sub>m</sub>) + C
+                        </div>
+                        <p>Where <em>r</em> and <em>z</em> are cylindrical coordinates, <em>R<sub>m</sub></em> is the characteristic radius, and <em>k</em> is the axial field curvature, which is directly proportional to the applied trapping voltage.</p>
+
+                        <h3>Decoupled Equations of Motion</h3>
+                        <p>Because there are no cross-terms containing both <em>r</em> and <em>z</em> in the potential, the forces in the axial and radial directions are completely decoupled:</p>
+                        <ul>
+                            <li><strong>Axial Restoring Force (Harmonic):</strong><br>
+                                The axial force is linear with distance from the center: F<sub>z</sub> = -q &middot; k &middot; z. The equation of motion is:
+                                <div class="theory-equation">
+                                    m &middot; d<sup>2</sup>z/dt<sup>2</sup> = -q &middot; k &middot; z
+                                </div>
+                                This results in <strong>Simple Harmonic Motion</strong> along the z-axis!
+                            </li>
+                            <li><strong>Axial Oscillation Frequency:</strong><br>
+                                Solving the harmonic oscillator equation yields the frequency:
+                                <div class="theory-equation">
+                                    &omega;<sub>z</sub> = &radic;(q &middot; k / m)
+                                </div>
+                                <span style="color:var(--accent-cyan); font-weight:bold;">Critical Note:</span> The frequency &omega;<sub>z</sub> is independent of the ion's initial position, angle, and energy! It depends <em>only</em> on the mass-to-charge ratio (m/q). This is the foundation of high-resolution Orbitrap mass spectrometry.
+                            </li>
+                            <li><strong>Radial Centrifugal Balance:</strong><br>
+                                In the radial plane (x-y), the electrostatic attraction towards the spindle balances the centrifugal force, trapping the ions in rosette-like orbits. Stable orbits must exist in the region r &lt; R<sub>m</sub>.
+                            </li>
+                        </ul>
+
+                        <h3>Electrodynamic Trapping</h3>
+                        <p>If ions were injected into a static full-voltage field, they would return to the injection point and strike the injector. By <strong>ramping the voltage</strong> (increasing <em>k</em>) immediately after injection, the potential well deepens, causing the orbits to contract and trapping the ions securely.</p>
+
+                        <h3>Differential Detection &amp; FT</h3>
+                        <p>The outer electrode is split in half along the z = 0 plane. As positive ions oscillate axially, they induce alternating image currents on the two halves. The differential amplifier measures this current:</p>
+                        <div class="theory-equation">
+                            I(t) &propto; &sum; q<sub>i</sub> &middot; v<sub>z, i</sub>(t)
+                        </div>
+                        <p>Taking the <strong>Fourier Transform (FT)</strong> of this time-domain signal converts it into a frequency spectrum, which is then mapped directly to a mass spectrum since m/z &propto; 1 / f<sup>2</sup>.</p>
+                    </div>
+                </div>
+            </div>
+        </aside>
+    </div>
+
+    <script type="module" src="/main.js"></script>
+</body>
+</html>

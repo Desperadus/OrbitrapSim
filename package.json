@@ -1,0 +1,15 @@
+{
+  "name": "orbitrap-sim",
+  "version": "1.0.0",
+  "description": "3D Physics Simulation of a Thermo Fisher Orbitrap using p5.js",
+  "main": "index.html",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}
