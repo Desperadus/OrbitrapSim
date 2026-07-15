@@ -86,15 +86,37 @@
                     <div class="controls-card">
                         <div class="card-title">
                             <span>Mass Spectrum (Fourier Transform)</span>
-                            <span style="font-size:9px; color:var(--accent-gold);">FTMS</span>
+                            <div class="spectrum-title-actions">
+                                <span style="font-size:9px; color:var(--accent-gold);">FTMS</span>
+                                <button class="btn btn-sm spectrum-zoom-in" id="btn-spectrum-zoom-in" type="button" title="Zoom in further on selected peak" aria-label="Zoom in further on selected peak" hidden>+</button>
+                                <button class="btn btn-sm spectrum-reset" id="btn-spectrum-reset" type="button" hidden>Reset zoom</button>
+                            </div>
                         </div>
                         <div class="plot-container">
                             <div class="plot-label-y">Intensity (dB)</div>
                             <div class="plot-label-x">m/z (Mass-to-charge)</div>
                             <canvas class="plot-canvas" id="canvas-mass-spec"></canvas>
                         </div>
-                        <div style="font-size:10px; color:var(--text-dim); text-align:center; font-family:var(--font-mono)">
-                            m/z &propto; 1 / f<sub>axial</sub><sup>2</sup> &bull; Higher transient time = better resolution
+                        <fieldset class="spectrum-processing">
+                            <legend>FT processing</legend>
+                            <label title="Subtract the signal mean before transforming to reduce the DC baseline.">
+                                <input type="checkbox" id="spectrum-remove-baseline">
+                                Remove baseline
+                            </label>
+                            <label title="Suppress Fourier sidelobes and ringing at the cost of a slightly wider main peak.">
+                                <input type="checkbox" id="spectrum-hann-window">
+                                Hann window
+                            </label>
+                            <label title="Interpolate the Fourier spectrum for a smoother curve and more stable centroid. This does not add resolving power.">
+                                <input type="checkbox" id="spectrum-zero-fill">
+                                2&times; zero-fill
+                            </label>
+                        </fieldset>
+                        <div class="spectrum-status" id="spectrum-acquisition-status">
+                            Transient: waiting for acquisition
+                        </div>
+                        <div class="spectrum-hint">
+                            Select a peak, then use + to zoom &bull; Resolution improves as the transient is collected
                         </div>
                     </div>
                 </div>

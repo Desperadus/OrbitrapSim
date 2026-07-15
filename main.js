@@ -36,9 +36,9 @@ let physicsStepCount = 0;
 let inspectedIonIndex = 0;
 
 // Signal buffer for FFT and Oscilloscope
-const transientSize = 4096;
-const zeroFillFactor = 4;
-const fftSize = transientSize * zeroFillFactor;
+// Retain a complete 16.777 ms acquisition rather than a short rolling trace.
+// At m/z 300 this is long enough to resolve peaks separated by about 0.1 m/z.
+const transientSize = 262144;
 let rawSignal = new Float32Array(transientSize);
 let signalPtr = 0;
 let signalCount = 0;
@@ -47,13 +47,32 @@ const detectorSettlingTime = 2.0;
 let detectorSampleAccumulator = 0;
 let detectorAcquiring = false;
 let detectorNoise = 5.0;
+let signalAbsMax = 0.01;
 
-// FFT Setup
-let revTable = new Int32Array(fftSize);
-let cosTable = new Float32Array(fftSize / 2);
-let sinTable = new Float32Array(fftSize / 2);
+// Interactive mass-spectrum view state
+const fullSpectrumRange = { min: 150.0, max: 650.0 };
+let spectrumView = { ...fullSpectrumRange };
+let spectrumPeakHitTargets = [];
+let selectedSpectrumPeak = null;
 
-function initFFT() {
+// FFT plans and results are cached because the acquisition can be large.
+const fftPlans = new Map();
+let cachedFftMag = new Float32Array(0);
+let cachedFftSize = 0;
+let cachedFftSignalCount = -1;
+let cachedFftUpdatedAt = 0;
+const spectrumRefreshIntervalMs = 250;
+let spectrumRemoveBaseline = false;
+let spectrumHannWindow = false;
+let spectrumZeroFill = false;
+
+function getFFTPlan(fftSize) {
+    const cachedPlan = fftPlans.get(fftSize);
+    if (cachedPlan) return cachedPlan;
+
+    const revTable = new Int32Array(fftSize);
+    const cosTable = new Float32Array(fftSize / 2);
+    const sinTable = new Float32Array(fftSize / 2);
     let limit = 1;
     let bit = fftSize >> 1;
     while (limit < fftSize) {
@@ -68,9 +87,15 @@ function initFFT() {
         cosTable[i] = Math.cos(angle);
         sinTable[i] = Math.sin(angle);
     }
+
+    const plan = { revTable, cosTable, sinTable };
+    fftPlans.set(fftSize, plan);
+    return plan;
 }
 
 function performFFT(re, im) {
+    const fftSize = re.length;
+    const { revTable, cosTable, sinTable } = getFFTPlan(fftSize);
     for (let i = 0; i < fftSize; i++) {
         let j = revTable[i];
         if (i < j) {
@@ -98,6 +123,60 @@ function performFFT(re, im) {
             }
         }
     }
+}
+
+function invalidateSpectrumCache() {
+    cachedFftMag = new Float32Array(0);
+    cachedFftSize = 0;
+    cachedFftSignalCount = -1;
+    cachedFftUpdatedAt = 0;
+}
+
+function refreshSpectrumFFT(validSignalCount, force = false) {
+    if (validSignalCount < 128) return;
+
+    const now = performance.now();
+    const hasCurrentTransform = cachedFftSignalCount === validSignalCount;
+    const newSamples = validSignalCount - cachedFftSignalCount;
+    const minimumNewSamples = Math.max(1, Math.floor(Math.max(cachedFftSignalCount, 0) * 0.005));
+    const acquisitionJustCompleted = validSignalCount === transientSize;
+    if (hasCurrentTransform || (!force && cachedFftSize > 0 && !acquisitionJustCompleted && (
+        now - cachedFftUpdatedAt < spectrumRefreshIntervalMs || newSamples < minimumNewSamples
+    ))) {
+        return;
+    }
+
+    // Grow the transform with the acquisition. Padding only to the next power
+    // of two keeps updates responsive without pretending to add resolution.
+    const baseFFTSize = Math.min(
+        transientSize,
+        2 ** Math.ceil(Math.log2(validSignalCount))
+    );
+    const fftSize = baseFFTSize * (spectrumZeroFill ? 2 : 1);
+    const fftRe = new Float32Array(fftSize);
+    const fftIm = new Float32Array(fftSize);
+
+    let baseline = 0;
+    if (spectrumRemoveBaseline) {
+        for (let i = 0; i < validSignalCount; i++) baseline += rawSignal[i];
+        baseline /= validSignalCount;
+    }
+    for (let i = 0; i < validSignalCount; i++) {
+        const windowScale = spectrumHannWindow && validSignalCount > 1
+            ? 0.5 * (1 - Math.cos((2 * Math.PI * i) / (validSignalCount - 1)))
+            : 1;
+        fftRe[i] = (rawSignal[i] - baseline) * windowScale;
+    }
+    performFFT(fftRe, fftIm);
+
+    const fftMag = new Float32Array(fftSize / 2);
+    for (let i = 0; i < fftMag.length; i++) {
+        fftMag[i] = Math.hypot(fftRe[i], fftIm[i]);
+    }
+    cachedFftMag = fftMag;
+    cachedFftSize = fftSize;
+    cachedFftSignalCount = validSignalCount;
+    cachedFftUpdatedAt = now;
 }
 
 // Electrode profile precalculations
@@ -278,18 +357,22 @@ function updatePhysics(dt) {
 
     // Start detector acquisition after settling time
     const acquisitionStart = (voltageRamping ? t_ramp_time : 0) + detectorSettlingTime;
-    if (!detectorAcquiring && timeElapsed >= acquisitionStart) {
+    if (!detectorAcquiring && signalPtr < transientSize && timeElapsed >= acquisitionStart) {
         detectorAcquiring = true;
         detectorSampleAccumulator = 0;
     }
 
     if (detectorAcquiring) {
         detectorSampleAccumulator += dt;
-        if (detectorSampleAccumulator >= detectorSampleInterval) {
-            detectorSampleAccumulator %= detectorSampleInterval;
+        while (detectorSampleAccumulator >= detectorSampleInterval && signalPtr < transientSize) {
+            detectorSampleAccumulator -= detectorSampleInterval;
             rawSignal[signalPtr] = currentSignalValue;
-            signalPtr = (signalPtr + 1) % transientSize;
-            signalCount++;
+            signalAbsMax = Math.max(signalAbsMax, Math.abs(currentSignalValue));
+            signalPtr++;
+            signalCount = signalPtr;
+        }
+        if (signalPtr >= transientSize) {
+            detectorAcquiring = false;
         }
     }
 
@@ -308,6 +391,16 @@ function updatePhysics(dt) {
     document.getElementById("stat-voltage").innerText = `${Math.round(currentVoltage)} V`;
     document.getElementById("stat-trapped").innerText = `${totalActiveIons} / ${ions.length}`;
     document.getElementById("stat-time").innerText = `${timeElapsed.toFixed(2)} \u03BCs`;
+}
+
+function advanceSimulationFrame() {
+    // Keep manual and automatic advancement numerically identical. A single
+    // UI step represents one rendered frame, including its stability substeps.
+    const stepsPerFrame = Math.max(5, Math.round(5 * simSpeed));
+    const dt = (baseDt * simSpeed) / stepsPerFrame;
+    for (let i = 0; i < stepsPerFrame; i++) {
+        updatePhysics(dt);
+    }
 }
 
 // Diagnostics Plotting
@@ -381,17 +474,7 @@ function updatePlots() {
 
     ctxOscilloscope.beginPath();
     
-    let tempBuf = new Float32Array(transientSize);
     const validSignalCount = Math.min(signalCount, transientSize);
-    if (signalCount >= transientSize) {
-        for (let i = 0; i < transientSize; i++) {
-            tempBuf[i] = rawSignal[(signalPtr + i) % transientSize];
-        }
-    } else {
-        for (let i = 0; i < validSignalCount; i++) {
-            tempBuf[i] = rawSignal[i];
-        }
-    }
 
     const paddingX = 40;
     const paddingY = 20;
@@ -399,21 +482,17 @@ function updatePlots() {
     const plotH = hOsc - paddingY - 10;
 
     // Auto-scale y-axis
-    let maxVal = 0.01;
-    for (let i = 0; i < transientSize; i++) {
-        let absVal = Math.abs(tempBuf[i]);
-        if (absVal > maxVal) maxVal = absVal;
-    }
-
-    for (let i = 0; i < transientSize; i++) {
-        let x = paddingX + (i / (transientSize - 1)) * plotW;
-        let valScaled = tempBuf[i] * (plotH / (2.2 * maxVal));
+    const displayPointCount = Math.min(validSignalCount, Math.max(2, Math.ceil(plotW * 2)));
+    for (let point = 0; point < displayPointCount; point++) {
+        const sampleIndex = Math.round((point / (displayPointCount - 1)) * Math.max(0, validSignalCount - 1));
+        let x = paddingX + (point / (displayPointCount - 1)) * plotW;
+        let valScaled = rawSignal[sampleIndex] * (plotH / (2.2 * signalAbsMax));
         let y = (paddingY + plotH / 2) - valScaled;
 
         if (y < paddingY) y = paddingY;
         if (y > paddingY + plotH) y = paddingY + plotH;
 
-        if (i === 0) {
+        if (point === 0) {
             ctxOscilloscope.moveTo(x, y);
         } else {
             ctxOscilloscope.lineTo(x, y);
@@ -438,40 +517,11 @@ function updatePlots() {
     ctxMassSpec.fillRect(0, 0, wSpec, hSpec);
     drawPlotGrid(ctxMassSpec, wSpec, hSpec);
 
-    // Baseline correction and Hann window
-    let fftRe = new Float32Array(fftSize);
-    let fftIm = new Float32Array(fftSize);
-    let sumX = 0;
-    let sumY = 0;
-    let sumXX = 0;
-    let sumXY = 0;
-    for (let i = 0; i < validSignalCount; i++) {
-        sumX += i;
-        sumY += tempBuf[i];
-        sumXX += i * i;
-        sumXY += i * tempBuf[i];
-    }
-    const denominator = validSignalCount * sumXX - sumX * sumX;
-    const trendSlope = denominator !== 0
-        ? (validSignalCount * sumXY - sumX * sumY) / denominator
-        : 0;
-    const trendIntercept = validSignalCount > 0
-        ? (sumY - trendSlope * sumX) / validSignalCount
-        : 0;
-
-    for (let i = 0; i < validSignalCount; i++) {
-        const win = validSignalCount > 1
-            ? 0.5 * (1 - Math.cos(2 * Math.PI * i / (validSignalCount - 1)))
-            : 1;
-        fftRe[i] = (tempBuf[i] - trendIntercept - trendSlope * i) * win;
-        fftIm[i] = 0.0;
-    }
-    performFFT(fftRe, fftIm);
-
-    let fftMag = new Float32Array(fftSize / 2);
-    for (let i = 0; i < fftSize / 2; i++) {
-        fftMag[i] = Math.sqrt(fftRe[i]*fftRe[i] + fftIm[i]*fftIm[i]);
-    }
+    // Transform the complete acquired transient. The transform grows with the
+    // data and is cached so a long acquisition does not stall every redraw.
+    refreshSpectrumFFT(validSignalCount);
+    const fftMag = cachedFftMag.length > 0 ? cachedFftMag : new Float32Array(2);
+    const fftSize = cachedFftSize || 4;
 
     const padX = 40;
     const padY = 20;
@@ -488,8 +538,10 @@ function updatePlots() {
 
     // Calibrate frequency to m/z
     const df = 1.0 / (fftSize * detectorSampleInterval);
-    const minMass = 150.0;
-    const maxMass = 650.0;
+    const minMass = fullSpectrumRange.min;
+    const maxMass = fullSpectrumRange.max;
+    const viewMinMass = spectrumView.min;
+    const viewMaxMass = spectrumView.max;
 
     // Estimate noise floor
     const minVisibleFrequency = (1.0 / (2.0 * Math.PI)) * Math.sqrt(V_final / maxMass);
@@ -509,6 +561,31 @@ function updatePlots() {
     ctxMassSpec.strokeStyle = "#9a6700";
     ctxMassSpec.lineWidth = 1.8;
     ctxMassSpec.shadowBlur = 0;
+
+    // Draw the Fourier response itself rather than replacing it with centroid
+    // sticks. Sampling the zero-filled FFT at each screen column preserves the
+    // raw peak envelope, shoulders, sidelobes, and noise at every zoom level.
+    const spectrumY = (magnitude) => {
+        const relativeDb = 20 * Math.log10(Math.max(magnitude, 1e-12) / maxVisibleMag);
+        const normalizedHeight = Math.max(0, 1 + relativeDb / 60);
+        return padY + specH - normalizedHeight * (specH - 10);
+    };
+    ctxMassSpec.beginPath();
+    for (let pixel = 0; pixel <= Math.ceil(specW); pixel++) {
+        const ratio = pixel / specW;
+        const mass = viewMinMass + ratio * (viewMaxMass - viewMinMass);
+        const frequency = (1.0 / (2.0 * Math.PI)) * Math.sqrt(V_final / mass);
+        const binPosition = frequency / df;
+        const lowerBin = Math.max(0, Math.min(fftMag.length - 1, Math.floor(binPosition)));
+        const upperBin = Math.min(fftMag.length - 1, lowerBin + 1);
+        const fraction = binPosition - lowerBin;
+        const magnitude = fftMag[lowerBin] * (1 - fraction) + fftMag[upperBin] * fraction;
+        const x = padX + pixel;
+        const y = spectrumY(magnitude);
+        if (pixel === 0) ctxMassSpec.moveTo(x, y);
+        else ctxMassSpec.lineTo(x, y);
+    }
+    ctxMassSpec.stroke();
 
     // Peak centroiding via parabolic fit
     let detectedPeaks = [];
@@ -537,26 +614,50 @@ function updatePlots() {
 
     detectedPeaks.sort((a, b) => b.magnitude - a.magnitude);
     detectedPeaks = detectedPeaks.slice(0, 12);
+    spectrumPeakHitTargets = [];
+    const selectedDetectedPeak = selectedSpectrumPeak === null
+        ? null
+        : detectedPeaks.reduce((closest, peak) => (
+            closest === null || Math.abs(peak.mass - selectedSpectrumPeak) < Math.abs(closest.mass - selectedSpectrumPeak)
+                ? peak
+                : closest
+        ), null);
 
-    ctxMassSpec.lineWidth = 2;
+    // Centroids remain as small hit targets for zoom selection, but the raw
+    // trace above is the spectrum visualization.
     for (const peak of detectedPeaks) {
-        const x = padX + ((peak.mass - minMass) / (maxMass - minMass)) * specW;
-        const relativeDb = 20 * Math.log10(Math.max(peak.magnitude, 1e-12) / maxVisibleMag);
-        const normalizedHeight = Math.max(0.08, 1 + relativeDb / 60);
-        const y = padY + specH - normalizedHeight * (specH - 10);
+        if (peak.mass < viewMinMass || peak.mass > viewMaxMass) continue;
+
+        const x = padX + ((peak.mass - viewMinMass) / (viewMaxMass - viewMinMass)) * specW;
+        const y = spectrumY(peak.magnitude);
+        const isSelected = peak === selectedDetectedPeak;
+        ctxMassSpec.fillStyle = isSelected ? "#1769aa" : "#9a6700";
         ctxMassSpec.beginPath();
-        ctxMassSpec.moveTo(x, padY + specH);
-        ctxMassSpec.lineTo(x, y);
-        ctxMassSpec.stroke();
+        ctxMassSpec.arc(x, y, isSelected ? 4 : 3, 0, 2 * Math.PI);
+        ctxMassSpec.fill();
+        if (isSelected) {
+            ctxMassSpec.strokeStyle = "rgba(23, 105, 170, 0.45)";
+            ctxMassSpec.lineWidth = 1;
+            ctxMassSpec.beginPath();
+            ctxMassSpec.moveTo(x, y + 5);
+            ctxMassSpec.lineTo(x, padY + specH);
+            ctxMassSpec.stroke();
+        }
         peak.x = x;
         peak.y = y;
+        spectrumPeakHitTargets.push({
+            mass: peak.mass,
+            x,
+            top: y,
+            bottom: padY + specH
+        });
     }
 
     // Label peaks
     ctxMassSpec.fillStyle = "#765000";
     ctxMassSpec.font = "9px monospace";
     ctxMassSpec.textAlign = "center";
-    for (const peak of detectedPeaks.slice(0, 6)) {
+    for (const peak of detectedPeaks.filter(peak => peak.x !== undefined).slice(0, 6)) {
         ctxMassSpec.fillText(peak.mass.toFixed(1), peak.x, Math.max(padY + 9, peak.y - 5));
     }
 
@@ -570,14 +671,31 @@ function updatePlots() {
         ctxMassSpec.fillText(message, padX + specW / 2, padY + specH / 2);
     }
 
+    const acquiredDuration = validSignalCount * detectorSampleInterval;
+    const acquisitionStatus = document.getElementById("spectrum-acquisition-status");
+    if (acquisitionStatus) {
+        const resolutionAt300 = ((1 / (2 * Math.PI)) * Math.sqrt(V_final / 300) * acquiredDuration) / 2;
+        const state = validSignalCount >= transientSize
+            ? "complete"
+            : detectorAcquiring ? "acquiring" : "waiting";
+        acquisitionStatus.innerText = `Transient: ${(acquiredDuration / 1000).toFixed(3)} ms / ${(transientSize * detectorSampleInterval / 1000).toFixed(3)} ms (${state}) • R₃₀₀ ≈ ${Math.round(resolutionAt300)}`;
+    }
+
     // Draw mass axis ticks
     ctxMassSpec.fillStyle = "var(--text-dim)";
     ctxMassSpec.font = "9px monospace";
     ctxMassSpec.textAlign = "center";
-    for (let val = minMass; val <= maxMass; val += 100) {
-        let ratio = (val - minMass) / (maxMass - minMass);
+    const viewSpan = viewMaxMass - viewMinMass;
+    const desiredTickStep = viewSpan / 5;
+    const tickPower = Math.pow(10, Math.floor(Math.log10(desiredTickStep)));
+    const tickScale = desiredTickStep / tickPower;
+    const tickStep = (tickScale <= 1 ? 1 : tickScale <= 2 ? 2 : tickScale <= 5 ? 5 : 10) * tickPower;
+    const firstTick = Math.ceil(viewMinMass / tickStep) * tickStep;
+    const tickDecimals = tickStep < 1 ? Math.ceil(-Math.log10(tickStep)) : 0;
+    for (let val = firstTick; val <= viewMaxMass + tickStep * 1e-6; val += tickStep) {
+        let ratio = (val - viewMinMass) / viewSpan;
         let x = padX + ratio * specW;
-        ctxMassSpec.fillText(`${val}`, x, padY + specH + 13);
+        ctxMassSpec.fillText(val.toFixed(tickDecimals), x, padY + specH + 13);
         ctxMassSpec.beginPath();
         ctxMassSpec.moveTo(x, padY + specH);
         ctxMassSpec.lineTo(x, padY + specH + 4);
@@ -667,6 +785,8 @@ function injectIons() {
     rawSignal.fill(0);
     signalPtr = 0;
     signalCount = 0;
+    signalAbsMax = 0.01;
+    invalidateSpectrumCache();
     detectorSampleAccumulator = 0;
     detectorAcquiring = false;
 
@@ -685,6 +805,8 @@ function reinjectCurrentIons() {
     rawSignal.fill(0);
     signalPtr = 0;
     signalCount = 0;
+    signalAbsMax = 0.01;
+    invalidateSpectrumCache();
     detectorSampleAccumulator = 0;
     detectorAcquiring = false;
 
@@ -781,18 +903,20 @@ const p5Sketch = (p) => {
     };
 
     p.draw = () => {
-        p.background(255);
+        // A cool, neutral backdrop gives the metal enough contrast without
+        // competing with the coloured ion trails.
+        p.background(236, 240, 244);
 
         if (isPlaying) {
-            // Sub-step integration for numerical stability
-            let stepsPerFrame = Math.max(5, Math.round(5 * simSpeed));
-            let dt = (baseDt * simSpeed) / stepsPerFrame;
-            for (let i = 0; i < stepsPerFrame; i++) {
-                updatePhysics(dt);
-            }
+            advanceSimulationFrame();
         }
 
-        p.ambientLight(145, 150, 160);
+        // Studio-style lighting: a warm key defines the electrode curvature,
+        // while the cool fill and rim light keep the cutaway legible.
+        p.ambientLight(58, 63, 70);
+        p.directionalLight(255, 244, 220, -0.45, 0.35, -1.0);
+        p.directionalLight(105, 145, 184, 0.7, -0.25, 0.45);
+        p.pointLight(255, 213, 155, -190, -130, 240);
         p.orbitControl(1, 1, 0.1);
         
         p.rotateX(-0.5);
@@ -804,12 +928,13 @@ const p5Sketch = (p) => {
 
         const drawScale = 4.0;
 
-        // Central spindle (Gold electrode)
+        // Central spindle: warm plated metal rather than a flat yellow fill.
         p.push();
         p.noStroke();
         let innerAlpha = p.map(innerOpacity, 0, 100, 0, 255);
-        p.ambientMaterial(218, 165, 32, innerAlpha);
-        drawRevolvedSurface3D(p, fullInnerProfile, 0, p.TWO_PI, 24, drawScale);
+        p.specularMaterial(190, 137, 42, innerAlpha);
+        p.shininess(88);
+        drawRevolvedSurface3D(p, fullInnerProfile, 0, p.TWO_PI, 36, drawScale);
         p.pop();
 
         // Outer electrodes (split barrel)
@@ -817,7 +942,8 @@ const p5Sketch = (p) => {
         if (outerAlpha > 0) {
             p.push();
             p.noStroke();
-            p.ambientMaterial(70, 130, 180, outerAlpha);
+            p.specularMaterial(112, 139, 158, outerAlpha);
+            p.shininess(115);
 
             let startTheta = p.PI - cutawayAngle / 2;
             let endTheta = p.PI + cutawayAngle / 2;
@@ -825,8 +951,8 @@ const p5Sketch = (p) => {
             let leftBarrelProfile = fullOuterProfile.filter(pt => pt.z < -0.5);
             let rightBarrelProfile = fullOuterProfile.filter(pt => pt.z > 0.5);
 
-            drawRevolvedSurface3D(p, leftBarrelProfile, startTheta, endTheta, 20, drawScale);
-            drawRevolvedSurface3D(p, rightBarrelProfile, startTheta, endTheta, 20, drawScale);
+            drawRevolvedSurface3D(p, leftBarrelProfile, startTheta, endTheta, 32, drawScale);
+            drawRevolvedSurface3D(p, rightBarrelProfile, startTheta, endTheta, 32, drawScale);
             p.pop();
         }
 
@@ -834,8 +960,8 @@ const p5Sketch = (p) => {
         p.push();
         p.translate(15.0 * drawScale, 30.0 * drawScale, -7.5 * drawScale);
         p.rotateX(p.HALF_PI);
-        p.ambientMaterial(120, 120, 130);
-        p.fill(120, 120, 130);
+        p.specularMaterial(94, 103, 112);
+        p.shininess(125);
         p.noStroke();
         p.cylinder(2.5 * drawScale, 15.0 * drawScale);
         p.pop();
@@ -907,6 +1033,22 @@ function drawCoordinateSystemAxes(p) {
 
 // Revolved 3D surface generator
 function drawRevolvedSurface3D(p, profile, startTheta, endTheta, stepsTheta, drawScale) {
+    const applyProfileNormal = (index, cosTheta, sinTheta) => {
+        const previous = profile[Math.max(0, index - 1)];
+        const next = profile[Math.min(profile.length - 1, index + 1)];
+        const axialDelta = next.z - previous.z;
+        const radialDelta = next.r - previous.r;
+
+        // Surface-of-revolution normal for x=z, y=r*cos(theta), z=r*sin(theta).
+        // Supplying it explicitly gives WebGL a smooth highlight across the
+        // machined profile instead of lighting every strip as a flat facet.
+        let nx = -radialDelta;
+        let ny = axialDelta * cosTheta;
+        let nz = axialDelta * sinTheta;
+        const length = Math.hypot(nx, ny, nz) || 1;
+        p.normal(nx / length, ny / length, nz / length);
+    };
+
     for (let i = 0; i < profile.length - 1; i++) {
         let p1 = profile[i];
         let p2 = profile[i+1];
@@ -920,11 +1062,13 @@ function drawRevolvedSurface3D(p, profile, startTheta, endTheta, stepsTheta, dra
             let x1 = p1.z * drawScale;
             let y1 = p1.r * cosT * drawScale;
             let z1 = p1.r * sinT * drawScale;
+            applyProfileNormal(i, cosT, sinT);
             p.vertex(x1, y1, z1);
             
             let x2 = p2.z * drawScale;
             let y2 = p2.r * cosT * drawScale;
             let z2 = p2.r * sinT * drawScale;
+            applyProfileNormal(i + 1, cosT, sinT);
             p.vertex(x2, y2, z2);
         }
         p.endShape();
@@ -961,10 +1105,86 @@ function setupUI() {
 
     document.getElementById("btn-step").addEventListener("click", () => {
         if (!isPlaying) {
-            updatePhysics(baseDt * simSpeed);
+            advanceSimulationFrame();
             updatePlots();
         }
     });
+
+    const spectrumZoomInButton = document.getElementById("btn-spectrum-zoom-in");
+    const spectrumResetButton = document.getElementById("btn-spectrum-reset");
+    const resetSpectrumZoom = () => {
+        spectrumView = { ...fullSpectrumRange };
+        selectedSpectrumPeak = null;
+        spectrumZoomInButton.hidden = true;
+        spectrumZoomInButton.disabled = false;
+        spectrumResetButton.hidden = true;
+        updatePlots();
+    };
+
+    const setSpectrumViewAroundPeak = (mass, span) => {
+        const fullSpan = fullSpectrumRange.max - fullSpectrumRange.min;
+        const boundedSpan = Math.min(span, fullSpan);
+        let min = mass - boundedSpan / 2;
+        let max = mass + boundedSpan / 2;
+        if (min < fullSpectrumRange.min) {
+            max += fullSpectrumRange.min - min;
+            min = fullSpectrumRange.min;
+        }
+        if (max > fullSpectrumRange.max) {
+            min -= max - fullSpectrumRange.max;
+            max = fullSpectrumRange.max;
+        }
+        spectrumView = { min, max };
+    };
+
+    const massSpecCanvas = document.getElementById("canvas-mass-spec");
+    massSpecCanvas.addEventListener("click", (event) => {
+        if (spectrumPeakHitTargets.length === 0) return;
+
+        const rect = massSpecCanvas.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        const selected = spectrumPeakHitTargets
+            .map(peak => ({
+                ...peak,
+                distance: Math.abs(peak.x - x)
+            }))
+            .filter(peak => peak.distance <= 12 && y >= peak.top - 10 && y <= peak.bottom + 10)
+            .sort((a, b) => a.distance - b.distance)[0];
+
+        if (!selected) return;
+
+        selectedSpectrumPeak = selected.mass;
+        setSpectrumViewAroundPeak(selectedSpectrumPeak, 50);
+        spectrumZoomInButton.hidden = false;
+        spectrumZoomInButton.disabled = false;
+        spectrumResetButton.hidden = false;
+        updatePlots();
+    });
+    spectrumZoomInButton.addEventListener("click", () => {
+        if (selectedSpectrumPeak === null) return;
+
+        const minimumSpan = 0.01;
+        const currentSpan = spectrumView.max - spectrumView.min;
+        const nextSpan = Math.max(minimumSpan, currentSpan / 2);
+        setSpectrumViewAroundPeak(selectedSpectrumPeak, nextSpan);
+        spectrumZoomInButton.disabled = nextSpan <= minimumSpan;
+        updatePlots();
+    });
+    spectrumResetButton.addEventListener("click", resetSpectrumZoom);
+
+    const processingControls = [
+        ["spectrum-remove-baseline", value => { spectrumRemoveBaseline = value; }],
+        ["spectrum-hann-window", value => { spectrumHannWindow = value; }],
+        ["spectrum-zero-fill", value => { spectrumZeroFill = value; }]
+    ];
+    for (const [id, applyValue] of processingControls) {
+        document.getElementById(id).addEventListener("change", event => {
+            applyValue(event.target.checked);
+            invalidateSpectrumCache();
+            updatePlots();
+        });
+    }
 
     document.getElementById("btn-reset").addEventListener("click", () => {
         injectIons();
@@ -1092,7 +1312,6 @@ function setupUI() {
 let p5Instance;
 
 function initApp() {
-    initFFT();
     generateElectrodeProfiles();
     injectIons();
     setupUI();
