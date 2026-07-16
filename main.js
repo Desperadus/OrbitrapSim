@@ -28,12 +28,64 @@ let cutawayAngle = Math.PI;
 let outerOpacity = 40;
 let innerOpacity = 90;
 let showGrid = true;
+let showElectricField = false;
 
 // Active ions array
 let ions = [];
 let nextIonId = 1;
 let physicsStepCount = 0;
 let inspectedIonIndex = 0;
+
+// Presentation is deliberately sampled independently from physics. At high
+// simulation speeds the exact ion state still advances on every integration
+// substep, while trails, plots, and DOM text only copy states often enough to
+// remain useful to a human observer.
+const maxTrailPoints = 350;
+const maxAxisPlotPoints = 500;
+let render3DInvalidated = true;
+let lastPlotUpdatedAt = -Infinity;
+
+function getPresentationIntervalMs() {
+    if (simSpeed <= 100) return 0;
+    if (simSpeed < 250) return 250;
+    return 1000;
+}
+
+function invalidate3DRender() {
+    render3DInvalidated = true;
+}
+
+function appendBoundedPoint(array, point, limit) {
+    array.push(point);
+    if (array.length > limit) {
+        array.splice(0, array.length - limit);
+    }
+}
+
+function sampleIonTrails() {
+    for (const ion of ions) {
+        if (!ion.renderVisible) continue;
+        const lastPoint = ion.history[ion.history.length - 1];
+        // Record a collision/escape point once, but do not keep appending the
+        // same inactive state on later redraws.
+        if (!ion.active && lastPoint &&
+            lastPoint.x === ion.x && lastPoint.y === ion.y && lastPoint.z === ion.z) {
+            continue;
+        }
+        appendBoundedPoint(
+            ion.history,
+            { x: ion.x, y: ion.y, z: ion.z },
+            2
+        );
+    }
+}
+
+function updateSimulationStats() {
+    const trappedCount = ions.reduce((count, ion) => count + (ion.active ? 1 : 0), 0);
+    document.getElementById("stat-voltage").innerText = `${Math.round(currentVoltage)} V`;
+    document.getElementById("stat-trapped").innerText = `${trappedCount} / ${ions.length}`;
+    document.getElementById("stat-time").innerText = `${timeElapsed.toFixed(2)} \u03BCs`;
+}
 
 // Signal buffer for FFT and Oscilloscope
 // Retain a complete 16.777 ms acquisition rather than a short rolling trace.
@@ -46,11 +98,26 @@ const detectorSampleInterval = baseDt * 16 / 5;
 const detectorSettlingTime = 2.0;
 let detectorSampleAccumulator = 0;
 let detectorAcquiring = false;
+let detectorSamplingStarted = false;
 let detectorNoise = 5.0;
 let signalAbsMax = 0.01;
+// Keep the oscilloscope on a fixed timebase so the waveform does not become
+// progressively compressed as the full FT transient is collected.
+const oscilloscopeWindowDuration = 25.0; // microseconds
+const oscilloscopeWindowSamples = Math.max(
+    2,
+    Math.round(oscilloscopeWindowDuration / detectorSampleInterval)
+);
+// The FT transient is finite, but the oscilloscope is a live instrument. Keep
+// a separate rolling buffer so its current trace continues after acquisition.
+let oscilloscopeSignal = new Float32Array(oscilloscopeWindowSamples);
+let oscilloscopeSignalPtr = 0;
+let oscilloscopeSignalCount = 0;
 
 // Interactive mass-spectrum view state
-const fullSpectrumRange = { min: 150.0, max: 650.0 };
+const referenceSpectrumRange = { min: 150.0, max: 650.0 };
+const lsdSpectrumRange = { min: 40.0, max: 340.0 };
+let fullSpectrumRange = { ...referenceSpectrumRange };
 let spectrumView = { ...fullSpectrumRange };
 let spectrumPeakHitTargets = [];
 let selectedSpectrumPeak = null;
@@ -62,9 +129,9 @@ let cachedFftSize = 0;
 let cachedFftSignalCount = -1;
 let cachedFftUpdatedAt = 0;
 const spectrumRefreshIntervalMs = 250;
-let spectrumRemoveBaseline = false;
-let spectrumHannWindow = false;
-let spectrumZeroFill = false;
+let spectrumRemoveBaseline = true;
+let spectrumHannWindow = true;
+let spectrumZeroFill = true;
 
 function getFFTPlan(fftSize) {
     const cachedPlan = fftPlans.get(fftSize);
@@ -184,6 +251,8 @@ let innerProfile = [];
 let outerProfile = [];
 let fullInnerProfile = [];
 let fullOuterProfile = [];
+let leftBarrelProfile = [];
+let rightBarrelProfile = [];
 
 function generateElectrodeProfiles() {
     innerProfile = [];
@@ -231,6 +300,11 @@ function generateElectrodeProfiles() {
     for (let i = 0; i < outerProfile.length; i++) {
         fullOuterProfile.push({ z: outerProfile[i].z, r: outerProfile[i].r });
     }
+
+    // These halves never change during a run, so avoid allocating and
+    // filtering them on every WebGL redraw.
+    leftBarrelProfile = fullOuterProfile.filter(pt => pt.z < -0.5);
+    rightBarrelProfile = fullOuterProfile.filter(pt => pt.z > 0.5);
 }
 
 function getElectrodeRadius(profile, z) {
@@ -275,12 +349,10 @@ function updatePhysics(dt) {
     // Calculate damping from vacuum quality
     dampingCoef = (100.0 - vacuumQuality) * 0.0005;
 
-    let totalActiveIons = 0;
     let currentSignalValue = 0.0;
 
     for (let ion of ions) {
         if (!ion.active) continue;
-        totalActiveIons++;
 
         // Verlet integration
         let a = getAcceleration(ion.x, ion.y, ion.z, ion.q, ion.m, kVal);
@@ -300,21 +372,20 @@ function updatePhysics(dt) {
         ion.y = nextY;
         ion.z = nextZ;
 
-        // Trace history for 3D path
-        ion.history.push({ x: ion.x, y: ion.y, z: ion.z });
-        if (ion.history.length > 350) {
-            ion.history.shift();
-        }
+        // Preserve the original smooth trails and axis traces through 100x.
+        // Above that speed these presentation buffers are frozen and physics
+        // continues without spending work on visually aliased samples.
+        if (simSpeed <= 100 && ion.renderVisible) {
+            appendBoundedPoint(
+                ion.history,
+                { x: ion.x, y: ion.y, z: ion.z },
+                maxTrailPoints
+            );
 
-        // Downsample coordinates for 2D plots
-        if (physicsStepCount % 8 === 0) {
-            ion.tSeriesX.push(ion.x);
-            ion.tSeriesY.push(ion.y);
-            ion.tSeriesZ.push(ion.z);
-            if (ion.tSeriesX.length > 500) {
-                ion.tSeriesX.shift();
-                ion.tSeriesY.shift();
-                ion.tSeriesZ.shift();
+            if (physicsStepCount % 8 === 0) {
+                appendBoundedPoint(ion.tSeriesX, ion.x, maxAxisPlotPoints);
+                appendBoundedPoint(ion.tSeriesY, ion.y, maxAxisPlotPoints);
+                appendBoundedPoint(ion.tSeriesZ, ion.z, maxAxisPlotPoints);
             }
         }
 
@@ -357,19 +428,31 @@ function updatePhysics(dt) {
 
     // Start detector acquisition after settling time
     const acquisitionStart = (voltageRamping ? t_ramp_time : 0) + detectorSettlingTime;
-    if (!detectorAcquiring && signalPtr < transientSize && timeElapsed >= acquisitionStart) {
-        detectorAcquiring = true;
+    if (!detectorSamplingStarted && timeElapsed >= acquisitionStart) {
+        detectorSamplingStarted = true;
+        detectorAcquiring = signalPtr < transientSize;
         detectorSampleAccumulator = 0;
     }
 
-    if (detectorAcquiring) {
+    if (detectorSamplingStarted) {
         detectorSampleAccumulator += dt;
-        while (detectorSampleAccumulator >= detectorSampleInterval && signalPtr < transientSize) {
+        while (detectorSampleAccumulator >= detectorSampleInterval) {
             detectorSampleAccumulator -= detectorSampleInterval;
-            rawSignal[signalPtr] = currentSignalValue;
+
+            oscilloscopeSignal[oscilloscopeSignalPtr] = currentSignalValue;
+            oscilloscopeSignalPtr = (oscilloscopeSignalPtr + 1) % oscilloscopeWindowSamples;
+            oscilloscopeSignalCount = Math.min(
+                oscilloscopeSignalCount + 1,
+                oscilloscopeWindowSamples
+            );
+
             signalAbsMax = Math.max(signalAbsMax, Math.abs(currentSignalValue));
-            signalPtr++;
-            signalCount = signalPtr;
+
+            if (signalPtr < transientSize) {
+                rawSignal[signalPtr] = currentSignalValue;
+                signalPtr++;
+                signalCount = signalPtr;
+            }
         }
         if (signalPtr >= transientSize) {
             detectorAcquiring = false;
@@ -388,9 +471,6 @@ function updatePhysics(dt) {
     }
 
     timeElapsed += dt;
-    document.getElementById("stat-voltage").innerText = `${Math.round(currentVoltage)} V`;
-    document.getElementById("stat-trapped").innerText = `${totalActiveIons} / ${ions.length}`;
-    document.getElementById("stat-time").innerText = `${timeElapsed.toFixed(2)} \u03BCs`;
 }
 
 function advanceSimulationFrame() {
@@ -459,7 +539,9 @@ function drawPlotGrid(ctx, w, h) {
     }
 }
 
-function updatePlots() {
+function updatePlots(oscilloscopeOnly = false) {
+    updateSimulationStats();
+
     // Oscilloscope (Transient Signal)
     const wOsc = cvsOscilloscope.width / (window.devicePixelRatio || 1);
     const hOsc = cvsOscilloscope.height / (window.devicePixelRatio || 1);
@@ -481,12 +563,19 @@ function updatePlots() {
     const plotW = wOsc - paddingX - 10;
     const plotH = hOsc - paddingY - 10;
 
-    // Auto-scale y-axis
-    const displayPointCount = Math.min(validSignalCount, Math.max(2, Math.ceil(plotW * 2)));
+    // Draw only the newest fixed-duration interval. Using the fixed window size
+    // for x positions also prevents the trace from stretching during startup.
+    const availablePointCount = oscilloscopeSignalCount;
+    const displayPointCount = Math.min(availablePointCount, Math.max(2, Math.ceil(plotW * 2)));
     for (let point = 0; point < displayPointCount; point++) {
-        const sampleIndex = Math.round((point / (displayPointCount - 1)) * Math.max(0, validSignalCount - 1));
-        let x = paddingX + (point / (displayPointCount - 1)) * plotW;
-        let valScaled = rawSignal[sampleIndex] * (plotH / (2.2 * signalAbsMax));
+        const sampleOffset = displayPointCount > 1
+            ? Math.round((point / (displayPointCount - 1)) * Math.max(0, availablePointCount - 1))
+            : 0;
+        const sampleIndex = oscilloscopeSignalCount < oscilloscopeWindowSamples
+            ? sampleOffset
+            : (oscilloscopeSignalPtr + sampleOffset) % oscilloscopeWindowSamples;
+        const x = paddingX + (sampleOffset / (oscilloscopeWindowSamples - 1)) * plotW;
+        let valScaled = oscilloscopeSignal[sampleIndex] * (plotH / (2.2 * signalAbsMax));
         let y = (paddingY + plotH / 2) - valScaled;
 
         if (y < paddingY) y = paddingY;
@@ -508,6 +597,11 @@ function updatePlots() {
     ctxOscilloscope.lineTo(paddingX, paddingY + plotH);
     ctxOscilloscope.lineTo(paddingX + plotW, paddingY + plotH);
     ctxOscilloscope.stroke();
+
+    // Once the finite FT transient is complete, periodic detector refreshes
+    // only need to repaint the live scope. Interactive calls still redraw all
+    // plots, so spectrum zoom and processing controls behave as before.
+    if (oscilloscopeOnly) return;
 
     // Mass Spectrum (FFT)
     const wSpec = cvsMassSpec.width / (window.devicePixelRatio || 1);
@@ -655,7 +749,7 @@ function updatePlots() {
 
     // Label peaks
     ctxMassSpec.fillStyle = "#765000";
-    ctxMassSpec.font = "9px monospace";
+    ctxMassSpec.font = "9px 'Inter', sans-serif";
     ctxMassSpec.textAlign = "center";
     for (const peak of detectedPeaks.filter(peak => peak.x !== undefined).slice(0, 6)) {
         ctxMassSpec.fillText(peak.mass.toFixed(1), peak.x, Math.max(padY + 9, peak.y - 5));
@@ -663,7 +757,7 @@ function updatePlots() {
 
     if (validSignalCount < 128) {
         ctxMassSpec.fillStyle = "#64748b";
-        ctxMassSpec.font = "10px monospace";
+        ctxMassSpec.font = "10px 'Inter', sans-serif";
         ctxMassSpec.textAlign = "center";
         const message = detectorAcquiring
             ? `Acquiring transient… ${validSignalCount} / ${transientSize}`
@@ -683,7 +777,7 @@ function updatePlots() {
 
     // Draw mass axis ticks
     ctxMassSpec.fillStyle = "var(--text-dim)";
-    ctxMassSpec.font = "9px monospace";
+    ctxMassSpec.font = "9px 'Inter', sans-serif";
     ctxMassSpec.textAlign = "center";
     const viewSpan = viewMaxMass - viewMinMass;
     const desiredTickStep = viewSpan / 5;
@@ -734,7 +828,7 @@ function updatePlots() {
             ctxIonAxes.beginPath();
             
             for (let i = 0; i < len; i++) {
-                let x = pX + (i / 500) * iW;
+                let x = pX + (i / maxAxisPlotPoints) * iW;
                 let valScaled = series[i] * (iH / 110);
                 let y = (pY + iH / 2) - valScaled;
 
@@ -776,12 +870,35 @@ function updatePlots() {
 }
 
 // Ion management
-function injectIons() {
-    ions = [];
-    nextIonId = 1;
+// Relative abundances follow the supplied/reference EI spectrum. The molecular
+// ion uses the monoisotopic mass of C20H25N3O; the other entries are the
+// characteristic nominal-mass fragments reported for LSD.
+const lsdEiIonProfile = [
+    { mz: 44.0, abundance: 8 }, { mz: 58.0, abundance: 4 },
+    { mz: 72.0, abundance: 35 }, { mz: 74.0, abundance: 4 },
+    { mz: 89.0, abundance: 4 }, { mz: 100.0, abundance: 5 },
+    { mz: 111.0, abundance: 6 }, { mz: 127.0, abundance: 7 },
+    { mz: 128.0, abundance: 10 }, { mz: 152.0, abundance: 11 },
+    { mz: 154.0, abundance: 15 }, { mz: 167.0, abundance: 13 },
+    { mz: 178.0, abundance: 11 }, { mz: 180.0, abundance: 20 },
+    { mz: 181.0, abundance: 78 }, { mz: 192.0, abundance: 12 },
+    { mz: 196.0, abundance: 30 }, { mz: 207.0, abundance: 66 },
+    { mz: 208.0, abundance: 19 }, { mz: 209.0, abundance: 7 },
+    { mz: 221.0, abundance: 100 }, { mz: 222.0, abundance: 40 },
+    { mz: 223.0, abundance: 18 }, { mz: 235.0, abundance: 4 },
+    { mz: 249.0, abundance: 7 }, { mz: 265.0, abundance: 11 },
+    { mz: 280.0, abundance: 8 }, { mz: 281.0, abundance: 13 },
+    { mz: 294.0, abundance: 5 },
+    { mz: 323.199762, abundance: 88, label: "LSD molecular ion" },
+    { mz: 324.203117, abundance: 18, label: "LSD M+1 isotope" }
+];
+
+let ionPacketType = "reference";
+
+function resetDetectorAcquisition() {
     timeElapsed = 0.0;
     physicsStepCount = 0;
-    
+    currentVoltage = V_init;
     rawSignal.fill(0);
     signalPtr = 0;
     signalCount = 0;
@@ -789,37 +906,101 @@ function injectIons() {
     invalidateSpectrumCache();
     detectorSampleAccumulator = 0;
     detectorAcquiring = false;
+    detectorSamplingStarted = false;
+    oscilloscopeSignal.fill(0);
+    oscilloscopeSignalPtr = 0;
+    oscilloscopeSignalCount = 0;
+}
+
+function setSpectrumRange(range) {
+    fullSpectrumRange = { ...range };
+    spectrumView = { ...range };
+    selectedSpectrumPeak = null;
+}
+
+function getLsdIonColor(mz) {
+    if (mz >= 300) return "#a23b72";
+    if (mz >= 200) return "#655281";
+    if (mz >= 120) return "#1769aa";
+    return "#9a6700";
+}
+
+function chooseWeightedProfileEntry(totalWeight) {
+    let cursor = Math.random() * totalWeight;
+    for (const entry of lsdEiIonProfile) {
+        cursor -= entry.abundance;
+        if (cursor <= 0) return entry;
+    }
+    return lsdEiIonProfile[lsdEiIonProfile.length - 1];
+}
+
+function selectRandomRenderedIons(count = 3) {
+    for (const ion of ions) ion.renderVisible = false;
+    const availableIndices = ions.map((_, index) => index);
+    for (let i = 0; i < Math.min(count, availableIndices.length); i++) {
+        const selectedOffset = i + Math.floor(Math.random() * (availableIndices.length - i));
+        [availableIndices[i], availableIndices[selectedOffset]] = [availableIndices[selectedOffset], availableIndices[i]];
+        ions[availableIndices[i]].renderVisible = true;
+    }
+}
+
+function updateInjectionSummary() {
+    const summary = document.getElementById("injection-summary");
+    if (!summary) return;
+    const renderedCount = ions.reduce((count, ion) => count + (ion.renderVisible ? 1 : 0), 0);
+    summary.innerText = ionPacketType === "lsd"
+        ? `C₂₀H₂₅N₃O + EI fragments • ${ions.length} ions • ${renderedCount} shown`
+        : `Reference packet • ${ions.length} ions`;
+}
+
+function injectIons() {
+    ions = [];
+    nextIonId = 1;
+    ionPacketType = "reference";
+    setSpectrumRange(referenceSpectrumRange);
+    resetDetectorAcquisition();
 
     addIon(300, "#00f2ff", 30.0, 15.0);
     addIon(400, "#ffd700", 30.0, 15.0);
     addIon(500, "#ff007f", 30.0, 15.0);
-
     repopulateInspectSelect();
+    updateInjectionSummary();
+}
+
+function injectLsdIons() {
+    ions = [];
+    nextIonId = 1;
+    ionPacketType = "lsd";
+    setSpectrumRange(lsdSpectrumRange);
+    resetDetectorAcquisition();
+
+    const packetSize = 150 + Math.floor(Math.random() * 151);
+    const totalWeight = lsdEiIonProfile.reduce((sum, entry) => sum + entry.abundance, 0);
+    for (let i = 0; i < packetSize; i++) {
+        const entry = chooseWeightedProfileEntry(totalWeight);
+        const rInject = 30.0 + (Math.random() - 0.5) * 0.35;
+        const zInject = 15.0 + (Math.random() - 0.5) * 0.5;
+        addIon(entry.mz, getLsdIonColor(entry.mz), rInject, zInject, {
+            label: entry.label || `LSD fragment m/z ${Math.round(entry.mz)}`,
+            source: "LSD EI",
+            renderVisible: false
+        });
+    }
+
+    selectRandomRenderedIons(3);
+    repopulateInspectSelect();
+    updateInjectionSummary();
 }
 
 function reinjectCurrentIons() {
-    timeElapsed = 0.0;
-    physicsStepCount = 0;
-    currentVoltage = V_init;
-    
-    rawSignal.fill(0);
-    signalPtr = 0;
-    signalCount = 0;
-    signalAbsMax = 0.01;
-    invalidateSpectrumCache();
-    detectorSampleAccumulator = 0;
-    detectorAcquiring = false;
-
+    resetDetectorAcquisition();
     for (let ion of ions) {
         ion.x = ion.rInject;
         ion.y = 0.0;
         ion.z = ion.zInject;
-        
-        // Calculate tangential injection velocity for stable orbit
-        ion.vy = 0.98 * Math.sqrt( (ion.q * currentVoltage) / (2 * ion.m) * (ion.x * ion.x - R_m * R_m) );
+        ion.vy = 0.98 * Math.sqrt((ion.q * currentVoltage) / (2 * ion.m) * (ion.x * ion.x - R_m * R_m));
         ion.vx = 0.0;
         ion.vz = 0.0;
-        
         ion.active = true;
         ion.collisionStatus = null;
         ion.hasLeftInjector = false;
@@ -830,7 +1011,7 @@ function reinjectCurrentIons() {
     }
 }
 
-function addIon(mz, colorHex, rInject, zInject) {
+function addIon(mz, colorHex, rInject, zInject, metadata = {}) {
     let qVal = 1.0;
     let mVal = mz * qVal;
     
@@ -858,6 +1039,9 @@ function addIon(mz, colorHex, rInject, zInject) {
         zInject: zInject,
         hasLeftInjector: false,
         color: colorHex,
+        label: metadata.label || null,
+        source: metadata.source || "reference",
+        renderVisible: metadata.renderVisible ?? true,
         active: true,
         collisionStatus: null,
         history: [],
@@ -871,45 +1055,116 @@ function repopulateInspectSelect() {
     let select = document.getElementById("select-inspect-ion");
     select.innerHTML = "";
     ions.forEach((ion, index) => {
+        if (!ion.renderVisible) return;
         let opt = document.createElement("option");
         opt.value = index;
         let colorName = ion.color === "#00f2ff" ? "Cyan" : (ion.color === "#ffd700" ? "Yellow" : "Pink");
         if (ion.id > 3) colorName = "Custom";
-        opt.innerText = `Ion ${ion.id} (m/z ${Math.round(ion.mz)} - ${colorName})`;
+        opt.innerText = ion.label
+            ? `${ion.label} (m/z ${ion.mz.toFixed(3)})`
+            : `Ion ${ion.id} (m/z ${Math.round(ion.mz)} - ${colorName})`;
         select.appendChild(opt);
     });
-    
-    inspectedIonIndex = Math.min(inspectedIonIndex, ions.length - 1);
-    if (inspectedIonIndex < 0) inspectedIonIndex = 0;
+
+    const visibleIndices = ions
+        .map((ion, index) => ion.renderVisible ? index : -1)
+        .filter(index => index >= 0);
+    if (!visibleIndices.includes(inspectedIonIndex)) inspectedIonIndex = visibleIndices[0] ?? 0;
     select.value = inspectedIonIndex;
 }
 
 // 3D Rendering (p5.js)
 const p5Sketch = (p) => {
-    let font;
+    let last3DRenderedAt = -Infinity;
+    let canvasIsVisible = true;
 
     p.setup = () => {
         const holder = document.getElementById("p5-canvas-holder");
         const canvas = p.createCanvas(holder.clientWidth, holder.clientHeight, p.WEBGL);
         canvas.parent(holder);
         p.pixelDensity(1);
+        canvas.style('touch-action', 'none');
+
+        if ("IntersectionObserver" in window) {
+            const observer = new IntersectionObserver(entries => {
+                canvasIsVisible = entries[0]?.isIntersecting ?? true;
+                if (canvasIsVisible) invalidate3DRender();
+            });
+            observer.observe(holder);
+        }
         
         p.debugMode;
         
         window.addEventListener('resize', () => {
             const h = document.getElementById("p5-canvas-holder");
             p.resizeCanvas(h.clientWidth, h.clientHeight);
+            invalidate3DRender();
         });
+
+        // Use distance-relative wheel zoom so both small touchpad deltas and
+        // larger mouse-wheel steps produce a visible, smooth camera change.
+        canvas.elt.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+
+            const cam = p._renderer.curCamera;
+            if (!cam) return;
+
+            if (typeof cam._orbit === 'function') {
+                const deltaPixels = e.deltaY * (
+                    e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 :
+                    e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? canvas.elt.clientHeight :
+                    1
+                );
+                const currentRadius = Math.hypot(
+                    cam.eyeX - cam.centerX,
+                    cam.eyeY - cam.centerY,
+                    cam.eyeZ - cam.centerZ
+                );
+                const zoomRate = e.ctrlKey ? 0.006 : 0.003;
+                const requestedRadius = currentRadius * Math.exp(deltaPixels * zoomRate);
+                const nextRadius = Math.min(4000, Math.max(80, requestedRadius));
+                cam._orbit(0, 0, nextRadius - currentRadius);
+                invalidate3DRender();
+            }
+        }, { capture: true, passive: false });
     };
 
     p.draw = () => {
-        // A cool, neutral backdrop gives the metal enough contrast without
-        // competing with the coloured ion trails.
-        p.background(236, 240, 244);
-
         if (isPlaying) {
             advanceSimulationFrame();
         }
+
+        // On narrow/mobile layouts the 3D panel can be fully off-screen while
+        // the user reads controls below it. Keep simulating, but skip invisible
+        // WebGL work until it scrolls back into view.
+        if (!canvasIsVisible) return;
+
+        const now = performance.now();
+        const canvasHovered = p.mouseX >= 0 && p.mouseX <= p.width &&
+            p.mouseY >= 0 && p.mouseY <= p.height;
+        const cameraIsMoving = p.mouseIsPressed && canvasHovered;
+        const refreshInterval = getPresentationIntervalMs();
+        const presentationDue = refreshInterval === 0 ||
+            now - last3DRenderedAt >= refreshInterval;
+
+        // The canvas retains its previous WebGL frame. Returning here avoids
+        // rebuilding the electrode mesh and trails while physics continues.
+        if (!render3DInvalidated && !cameraIsMoving &&
+            (!isPlaying || !presentationDue)) {
+            return;
+        }
+
+        if (simSpeed > 100) {
+            sampleIonTrails();
+        }
+        updateSimulationStats();
+        last3DRenderedAt = now;
+        render3DInvalidated = false;
+
+        // A cool, neutral backdrop gives the metal enough contrast without
+        // competing with the coloured ion trails.
+        p.background(236, 240, 244);
 
         // Studio-style lighting: a warm key defines the electrode curvature,
         // while the cool fill and rim light keep the cutaway legible.
@@ -927,6 +1182,10 @@ const p5Sketch = (p) => {
         }
 
         const drawScale = 4.0;
+
+        if (showElectricField) {
+            drawOrbitrapElectricField(p, drawScale);
+        }
 
         // Central spindle: warm plated metal rather than a flat yellow fill.
         p.push();
@@ -948,9 +1207,6 @@ const p5Sketch = (p) => {
             let startTheta = p.PI - cutawayAngle / 2;
             let endTheta = p.PI + cutawayAngle / 2;
 
-            let leftBarrelProfile = fullOuterProfile.filter(pt => pt.z < -0.5);
-            let rightBarrelProfile = fullOuterProfile.filter(pt => pt.z > 0.5);
-
             drawRevolvedSurface3D(p, leftBarrelProfile, startTheta, endTheta, 32, drawScale);
             drawRevolvedSurface3D(p, rightBarrelProfile, startTheta, endTheta, 32, drawScale);
             p.pop();
@@ -968,20 +1224,20 @@ const p5Sketch = (p) => {
 
         // Ions and trails
         for (let ion of ions) {
-            if (!ion.active) continue;
+            if (!ion.active || !ion.renderVisible) continue;
 
             if (ion.history.length > 1) {
                 p.push();
                 p.noFill();
+                const trailColor = p.color(ion.color);
                 for (let j = 0; j < ion.history.length - 1; j++) {
                     let pt1 = ion.history[j];
                     let pt2 = ion.history[j+1];
                     
                     let alpha = p.map(j, 0, ion.history.length - 1, 0, 255);
-                    let c = p.color(ion.color);
-                    c.setAlpha(alpha);
+                    trailColor.setAlpha(alpha);
                     
-                    p.stroke(c);
+                    p.stroke(trailColor);
                     p.strokeWeight(p.map(j, 0, ion.history.length - 1, 0.4, 2.5));
                     p.line(
                         pt1.z * drawScale, pt1.x * drawScale, pt1.y * drawScale,
@@ -994,15 +1250,16 @@ const p5Sketch = (p) => {
             p.push();
             p.translate(ion.z * drawScale, ion.x * drawScale, ion.y * drawScale);
             p.noStroke();
-            p.ambientMaterial(p.color(ion.color));
-            p.fill(p.color(ion.color));
+            const ionColor = p.color(ion.color);
+            p.ambientMaterial(ionColor);
+            p.fill(ionColor);
             p.sphere(3.5);
             p.pop();
         }
         
         // Collision points
         for (let ion of ions) {
-            if (!ion.active && ion.history.length > 0) {
+            if (ion.renderVisible && !ion.active && ion.history.length > 0) {
                 let lastPt = ion.history[ion.history.length - 1];
                 p.push();
                 p.translate(lastPt.z * drawScale, lastPt.x * drawScale, lastPt.y * drawScale);
@@ -1014,6 +1271,106 @@ const p5Sketch = (p) => {
         }
     };
 };
+
+// Draw the axisymmetric Orbitrap field throughout the 3D trapping volume. The
+// vectors use the same Kingdon/quadru-logarithmic potential as the ion
+// integrator; their direction is the force direction for a positive ion.
+function drawOrbitrapElectricField(p, drawScale) {
+    const vectors = [];
+    let maximumMagnitude = 0;
+    const axialSamples = [-36, -24, -12, 0, 12, 24, 36];
+    const radialFractions = [0.25, 0.55, 0.85];
+    const azimuthalSamples = 8;
+
+    for (const axialZ of axialSamples) {
+        const innerRadius = getElectrodeRadius(innerProfile, axialZ);
+        const outerRadius = getElectrodeRadius(outerProfile, axialZ);
+        if (innerRadius === null || outerRadius === null) continue;
+
+        const clearance = 1.8;
+        const availableRadius = outerRadius - innerRadius - 2 * clearance;
+        if (availableRadius <= 0) continue;
+
+        for (const fraction of radialFractions) {
+            const radius = innerRadius + clearance + availableRadius * fraction;
+            const radiusSquared = radius * radius;
+            const fieldRadial = 0.5 * currentVoltage * radius *
+                ((R_m * R_m) / radiusSquared - 1);
+            const fieldAxial = -currentVoltage * axialZ;
+            const magnitude = Math.hypot(fieldAxial, fieldRadial);
+            maximumMagnitude = Math.max(maximumMagnitude, magnitude);
+
+            for (let azimuthIndex = 0; azimuthIndex < azimuthalSamples; azimuthIndex++) {
+                const theta = p.TWO_PI * azimuthIndex / azimuthalSamples;
+                vectors.push({
+                    axialZ,
+                    radialY: radius * Math.cos(theta),
+                    radialZ: radius * Math.sin(theta),
+                    fieldAxial,
+                    fieldRadial,
+                    theta,
+                    magnitude
+                });
+            }
+        }
+    }
+
+    if (maximumMagnitude <= 0) return;
+
+    const lowColor = p.color(22, 134, 183, 210);
+    const highColor = p.color(209, 139, 32, 235);
+    p.push();
+    p.noFill();
+
+    for (const vector of vectors) {
+        const normalizedStrength = Math.sqrt(vector.magnitude / maximumMagnitude);
+        const vectorLength = p.lerp(7, 17, normalizedStrength);
+        const unitAxial = vector.fieldAxial / vector.magnitude;
+        const unitRadial = vector.fieldRadial / vector.magnitude;
+        const cosTheta = Math.cos(vector.theta);
+        const sinTheta = Math.sin(vector.theta);
+        const unitY = unitRadial * cosTheta;
+        const unitZ = unitRadial * sinTheta;
+        const startX = vector.axialZ * drawScale;
+        const startY = vector.radialY * drawScale;
+        const startZ = vector.radialZ * drawScale;
+        const endX = startX + unitAxial * vectorLength;
+        const endY = startY + unitY * vectorLength;
+        const endZ = startZ + unitZ * vectorLength;
+        const fieldColor = p.lerpColor(lowColor, highColor, normalizedStrength);
+
+        p.stroke(fieldColor);
+        p.strokeWeight(p.lerp(1.1, 2.0, normalizedStrength));
+        p.line(startX, startY, startZ, endX, endY, endZ);
+
+        const headLength = 4.5;
+        const headWidth = 2.6;
+        const baseX = endX - unitAxial * headLength;
+        const baseY = endY - unitY * headLength;
+        const baseZ = endZ - unitZ * headLength;
+
+        // Two perpendicular axes at the arrow base make the head a small 3D
+        // pyramid instead of a flat V that disappears from oblique views.
+        const tangentY = -sinTheta;
+        const tangentZ = cosTheta;
+        const normalX = unitRadial;
+        const normalY = -unitAxial * cosTheta;
+        const normalZ = -unitAxial * sinTheta;
+        p.line(endX, endY, endZ,
+            baseX, baseY + tangentY * headWidth, baseZ + tangentZ * headWidth);
+        p.line(endX, endY, endZ,
+            baseX, baseY - tangentY * headWidth, baseZ - tangentZ * headWidth);
+        p.line(endX, endY, endZ,
+            baseX + normalX * headWidth,
+            baseY + normalY * headWidth,
+            baseZ + normalZ * headWidth);
+        p.line(endX, endY, endZ,
+            baseX - normalX * headWidth,
+            baseY - normalY * headWidth,
+            baseZ - normalZ * headWidth);
+    }
+    p.pop();
+}
 
 // Axes drawing helper
 function drawCoordinateSystemAxes(p) {
@@ -1092,6 +1449,7 @@ function setupUI() {
             
             resizeCanvasElements();
             updatePlots();
+            lastPlotUpdatedAt = performance.now();
         });
     });
 
@@ -1101,12 +1459,14 @@ function setupUI() {
         isPlaying = !isPlaying;
         btnPlay.innerText = isPlaying ? "Pause" : "Play";
         btnPlay.classList.toggle("btn-primary");
+        invalidate3DRender();
     });
 
     document.getElementById("btn-step").addEventListener("click", () => {
         if (!isPlaying) {
             advanceSimulationFrame();
             updatePlots();
+            invalidate3DRender();
         }
     });
 
@@ -1188,21 +1548,39 @@ function setupUI() {
 
     document.getElementById("btn-reset").addEventListener("click", () => {
         injectIons();
-        updatePlots();
+        document.getElementById("inject-lsd").checked = false;
+        resetSpectrumZoom();
+        invalidate3DRender();
     });
 
     document.getElementById("btn-inject").addEventListener("click", () => {
-        reinjectCurrentIons();
-        updatePlots();
+        if (document.getElementById("inject-lsd").checked) {
+            injectLsdIons();
+        } else if (ionPacketType === "lsd") {
+            injectIons();
+        } else {
+            reinjectCurrentIons();
+        }
+        resetSpectrumZoom();
+        invalidate3DRender();
     });
+
+    document.getElementById("inject-lsd").addEventListener("change", updateInjectionSummary);
 
     // Controls & sliders
     const speedInput = document.getElementById("input-sim-speed");
     const applySimulationSpeed = () => {
         const nextSpeed = Number(speedInput.value);
         if (Number.isFinite(nextSpeed) && nextSpeed > 0) {
+            const wasHighSpeed = simSpeed > 100;
             simSpeed = nextSpeed;
+            if (wasHighSpeed && simSpeed <= 100) {
+                // Do not connect the sparse high-speed snapshots to the newly
+                // resumed dense trail; start a clean visual trail instead.
+                for (const ion of ions) ion.history = [];
+            }
             speedInput.setCustomValidity("");
+            invalidate3DRender();
         } else {
             speedInput.setCustomValidity("Enter a simulation speed greater than 0.");
         }
@@ -1251,23 +1629,35 @@ function setupUI() {
         let degrees = parseInt(e.target.value);
         cutawayAngle = (degrees / 180.0) * Math.PI;
         document.getElementById("lbl-cutaway").innerText = `${degrees}°`;
+        invalidate3DRender();
     });
 
     const sliderOpacityOuter = document.getElementById("slider-opacity-outer");
     sliderOpacityOuter.addEventListener("input", (e) => {
         outerOpacity = parseInt(e.target.value);
         document.getElementById("lbl-opacity-outer").innerText = `${outerOpacity}%`;
+        invalidate3DRender();
     });
 
     const sliderOpacityInner = document.getElementById("slider-opacity-inner");
     sliderOpacityInner.addEventListener("input", (e) => {
         innerOpacity = parseInt(e.target.value);
         document.getElementById("lbl-opacity-inner").innerText = `${innerOpacity}%`;
+        invalidate3DRender();
     });
 
     document.getElementById("btn-toggle-grid").addEventListener("click", (e) => {
         showGrid = !showGrid;
         e.target.classList.toggle("btn-primary");
+        invalidate3DRender();
+    });
+
+    document.getElementById("btn-toggle-field").addEventListener("click", (e) => {
+        showElectricField = !showElectricField;
+        e.currentTarget.setAttribute("aria-pressed", String(showElectricField));
+        e.currentTarget.title = `${showElectricField ? "Hide" : "Show"} the Orbitrap electric field vectors`;
+        document.getElementById("electric-field-legend").hidden = !showElectricField;
+        invalidate3DRender();
     });
 
     const selectIon = document.getElementById("select-inspect-ion");
@@ -1299,11 +1689,13 @@ function setupUI() {
         
         inspectedIonIndex = ions.length - 1;
         document.getElementById("select-inspect-ion").value = inspectedIonIndex;
+        invalidate3DRender();
     });
 
     document.getElementById("btn-camera-reset").addEventListener("click", () => {
         if (p5Instance) {
-            p5Instance.resetMatrix();
+            p5Instance.camera();
+            invalidate3DRender();
         }
     });
 }
@@ -1319,11 +1711,23 @@ function initApp() {
 
     p5Instance = new p5(p5Sketch);
 
-    // Diagnostic plots update loop (~24 fps)
+    // Diagnostic canvases are presentation-only. Keep them fluid at ordinary
+    // speed, progressively throttle them when time is highly accelerated, and
+    // do no periodic drawing while their tabs are hidden.
     setInterval(() => {
-        if (isPlaying) {
-            updatePlots();
-        }
+        if (!isPlaying || document.hidden) return;
+
+        const activeTabId = document.querySelector(".tab-content.active")?.id;
+        if (activeTabId !== "tab-detector" && activeTabId !== "tab-trajectory") return;
+
+        const now = performance.now();
+        const refreshInterval = Math.max(40, getPresentationIntervalMs());
+        if (now - lastPlotUpdatedAt < refreshInterval) return;
+
+        const oscilloscopeOnly = activeTabId === "tab-detector" &&
+            signalCount >= transientSize && cachedFftSignalCount === transientSize;
+        updatePlots(oscilloscopeOnly);
+        lastPlotUpdatedAt = now;
     }, 40);
 }
 

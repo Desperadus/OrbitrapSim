@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Orbitrap 3D Physics Simulator</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/index.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
 </head>
@@ -24,6 +27,7 @@
                 <div class="canvas-overlay-controls">
                     <button class="btn btn-primary btn-sm" id="btn-camera-reset">Reset Camera</button>
                     <button class="btn btn-sm" id="btn-toggle-grid">Toggle Grid</button>
+                    <button class="btn btn-sm" id="btn-toggle-field" type="button" aria-pressed="false" title="Show the Orbitrap electric field vectors">Orbitrap Field</button>
                 </div>
                 <div class="canvas-overlay-stats">
                     <div class="stat-item">Voltage: <span class="val" id="stat-voltage">200 V</span></div>
@@ -32,6 +36,12 @@
                 </div>
                 <div class="canvas-nav-tips">
                     Drag mouse to Rotate 3D &bull; Scroll to Zoom
+                </div>
+                <div class="electric-field-legend" id="electric-field-legend" hidden>
+                    <span>Electric field</span>
+                    <span class="field-strength-scale" aria-hidden="true"></span>
+                    <span class="field-strength-labels"><span>Lower</span><span>Higher</span></span>
+                    <span class="field-direction-note">Arrows show force on a positive ion</span>
                 </div>
             </div>
 
@@ -51,8 +61,14 @@
                     <span class="speed-help" id="speed-help">Any value above 0</span>
                 </div>
 
-                <div class="sim-controls-group">
+                <div class="sim-controls-group injection-controls">
                     <button class="btn btn-primary" id="btn-inject">Re-inject Ions</button>
+                    <label class="sample-checkbox" title="Inject a 150–300 ion packet based on the reference EI mass spectrum of LSD.">
+                        <input type="checkbox" id="inject-lsd">
+                        <span class="sample-checkbox-mark" aria-hidden="true"></span>
+                        <span>LSD</span>
+                    </label>
+                    <span class="injection-summary" id="injection-summary" aria-live="polite">Reference packet • 3 ions</span>
                 </div>
             </div>
         </main>
@@ -100,15 +116,15 @@
                         <fieldset class="spectrum-processing">
                             <legend>FT processing</legend>
                             <label title="Subtract the signal mean before transforming to reduce the DC baseline.">
-                                <input type="checkbox" id="spectrum-remove-baseline">
+                                <input type="checkbox" id="spectrum-remove-baseline" checked>
                                 Remove baseline
                             </label>
                             <label title="Suppress Fourier sidelobes and ringing at the cost of a slightly wider main peak.">
-                                <input type="checkbox" id="spectrum-hann-window">
+                                <input type="checkbox" id="spectrum-hann-window" checked>
                                 Hann window
                             </label>
                             <label title="Interpolate the Fourier spectrum for a smoother curve and more stable centroid. This does not add resolving power.">
-                                <input type="checkbox" id="spectrum-zero-fill">
+                                <input type="checkbox" id="spectrum-zero-fill" checked>
                                 2&times; zero-fill
                             </label>
                         </fieldset>
